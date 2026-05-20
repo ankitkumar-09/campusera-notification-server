@@ -43,7 +43,9 @@ app.post('/sendNotification', async (req, res) => {
         error: 'Missing token',
       });
     }
-
+app.get('/', (req, res) => {
+  res.json({ status: 'ok' });
+});
     const message = {
       notification: {
         title: title || 'New Message',
