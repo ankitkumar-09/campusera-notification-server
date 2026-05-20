@@ -4,12 +4,17 @@ const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
 
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+// Firebase Admin Init
 const serviceAccount = {
   type: process.env.TYPE,
   project_id: process.env.PROJECT_ID,
   private_key_id: process.env.PRIVATE_KEY_ID,
-  private_key:
-    process.env.PRIVATE_KEY.replace(/\\n/g, '\n'),
+  private_key: process.env.PRIVATE_KEY.replace(/\\n/g, '\n'),
   client_email: process.env.CLIENT_EMAIL,
   client_id: process.env.CLIENT_ID,
   auth_uri: process.env.AUTH_URI,
@@ -19,43 +24,64 @@ const serviceAccount = {
   client_x509_cert_url:
     process.env.CLIENT_X509_CERT_URL,
 };
+
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-const app = express();
+// Health Route
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: 'CampusEra Notification Server Running',
+  });
+});
 
-app.use(cors());
-app.use(express.json());
-
+// Send Notification Route
 app.post('/sendNotification', async (req, res) => {
   try {
     const {
       token,
-      title,
+      senderName,
       body,
       senderId,
       receiverId,
+      activeChatUserId,
     } = req.body;
 
+    // Validation
     if (!token) {
       return res.status(400).json({
-        error: 'Missing token',
+        success: false,
+        error: 'FCM token missing',
       });
     }
-app.get('/', (req, res) => {
-  res.json({ status: 'ok' });
-});
+
+    // WhatsApp-style suppression
+    if (
+      activeChatUserId &&
+      activeChatUserId === senderId
+    ) {
+      return res.json({
+        success: true,
+        skipped: true,
+        reason: 'User already inside chat',
+      });
+    }
+
     const message = {
+      token,
+
       notification: {
-        title: title || 'New Message',
+        title: senderName || 'New Message',
         body: body || '',
       },
 
       data: {
+        type: 'chat',
         senderId: senderId || '',
         receiverId: receiverId || '',
-        type: 'chat',
+        senderName: senderName || '',
       },
 
       android: {
@@ -63,27 +89,35 @@ app.get('/', (req, res) => {
         notification: {
           channelId: 'campusera_channel',
           sound: 'default',
+          priority: 'high',
+          visibility: 'public',
         },
       },
 
-      token,
+      apns: {
+        payload: {
+          aps: {
+            sound: 'default',
+          },
+        },
+      },
     };
 
     const response = await admin
       .messaging()
       .send(message);
 
-    console.log('✅ Notification sent:', response);
+    console.log('✅ Push notification sent:', response);
 
-    res.json({
+    return res.json({
       success: true,
       response,
     });
 
   } catch (error) {
-    console.error(error);
+    console.error('❌ Notification Error:', error);
 
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
       error: error.message,
     });
