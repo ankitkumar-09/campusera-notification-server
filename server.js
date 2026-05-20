@@ -47,43 +47,32 @@ app.post('/sendNotification', async (req, res) => {
       senderId,
       receiverId,
       activeChatUserId,
+      type,
     } = req.body;
 
-    // Validation
     if (!token) {
-      return res.status(400).json({
-        success: false,
-        error: 'FCM token missing',
-      });
+      return res.status(400).json({ success: false, error: 'FCM token missing' });
     }
 
-    // WhatsApp-style suppression
-    if (
-      activeChatUserId &&
-      activeChatUserId === senderId
-    ) {
-      return res.json({
-        success: true,
-        skipped: true,
-        reason: 'User already inside chat',
-      });
+    // Only suppress for chat type, not for new_post
+    if (type !== 'new_post' && activeChatUserId && activeChatUserId === senderId) {
+      return res.json({ success: true, skipped: true, reason: 'User already inside chat' });
     }
+
+    const isPost = type === 'new_post';
 
     const message = {
       token,
-
       notification: {
-        title: senderName || 'New Message',
+        title: isPost ? `${senderName} posted` : senderName || 'New Message',
         body: body || '',
       },
-
       data: {
-        type: 'chat',
+        type: type || 'chat',
         senderId: senderId || '',
         receiverId: receiverId || '',
         senderName: senderName || '',
       },
-
       android: {
         priority: 'high',
         notification: {
@@ -93,37 +82,22 @@ app.post('/sendNotification', async (req, res) => {
           visibility: 'public',
         },
       },
-
       apns: {
         payload: {
-          aps: {
-            sound: 'default',
-          },
+          aps: { sound: 'default' },
         },
       },
     };
 
-    const response = await admin
-      .messaging()
-      .send(message);
-
-    console.log('✅ Push notification sent:', response);
-
-    return res.json({
-      success: true,
-      response,
-    });
+    const response = await admin.messaging().send(message);
+    console.log('✅ Push sent:', response);
+    return res.json({ success: true, response });
 
   } catch (error) {
     console.error('❌ Notification Error:', error);
-
-    return res.status(500).json({
-      success: false,
-      error: error.message,
-    });
+    return res.status(500).json({ success: false, error: error.message });
   }
 });
-
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
