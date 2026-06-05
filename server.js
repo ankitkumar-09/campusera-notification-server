@@ -181,6 +181,80 @@ app.post('/sendNotification', async (req, res) => {
 });
 
 // ===============================
+// Send Broadcast Route
+// ===============================
+app.post('/sendBroadcast', async (req, res) => {
+  try {
+    const { title, body, senderId, type } = req.body;
+
+    console.log('📨 Broadcast Request:', req.body);
+
+    if (!title || !body) {
+      return res.status(400).json({ success: false, error: 'title and body missing' });
+    }
+
+    // Fetch all users with tokens
+    const usersSnap = await admin.firestore().collection('users').get();
+    const tokens = [];
+    usersSnap.forEach((doc) => {
+      const token = doc.data().fcmToken;
+      if (token) tokens.push(token);
+    });
+
+    if (tokens.length === 0) {
+      return res.json({ success: true, skipped: true, reason: 'No tokens found' });
+    }
+
+    const message = {
+      notification: { title, body },
+      data: {
+        type: type || 'notice',
+        senderId: senderId || 'admin',
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'campusera_channel',
+          sound: 'default',
+        },
+      },
+      apns: {
+        payload: { aps: { sound: 'default' } },
+      },
+    };
+
+    let successCount = 0;
+    let failureCount = 0;
+
+    // Send in chunks of 500
+    const chunks = [];
+    for (let i = 0; i < tokens.length; i += 500) {
+      chunks.push(tokens.slice(i, i + 500));
+    }
+
+    for (const chunk of chunks) {
+      const multicastPayload = { ...message, tokens: chunk };
+      // Compatibility fallback: check if sendEachForMulticast exists (admin SDK v10+), otherwise sendMulticast
+      let response;
+      if (admin.messaging().sendEachForMulticast) {
+        response = await admin.messaging().sendEachForMulticast(multicastPayload);
+      } else {
+        response = await admin.messaging().sendMulticast(multicastPayload);
+      }
+      successCount += response.successCount;
+      failureCount += response.failureCount;
+    }
+
+    console.log(`✅ Broadcast sent: Success ${successCount}, Failed ${failureCount}`);
+    return res.json({ success: true, successCount, failureCount });
+
+  } catch (error) {
+    console.error('❌ Broadcast Error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ===============================
 // Global Error Handlers
 // ===============================
 process.on('uncaughtException', (err) => {
