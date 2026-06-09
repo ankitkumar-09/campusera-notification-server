@@ -132,6 +132,7 @@ app.post('/sendNotification', async (req, res) => {
           sound: 'default',
           priority: 'high',
           visibility: 'public',
+          tag: senderId || 'default',
         },
       },
 
