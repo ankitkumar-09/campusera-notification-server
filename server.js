@@ -19,6 +19,22 @@ app.use((req, res, next) => {
 });
 
 // ===============================
+// API Key Middleware
+// ===============================
+const API_KEY = process.env.API_KEY || 'default_secret_key'; // Replace in Render
+
+app.use((req, res, next) => {
+  if (req.url === '/') return next(); // allow health check
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ') || authHeader.split(' ')[1] !== API_KEY) {
+    console.log('❌ Unauthorized request');
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  next();
+});
+
+// ===============================
 // Firebase Admin Setup
 // ===============================
 // ✅ Build from individual Render env variables
@@ -83,11 +99,13 @@ app.post('/sendNotification', async (req, res) => {
       });
     }
 
-    // ✅ Always fetch fresh token from Firestore
+    // ✅ Always fetch fresh token from Firestore private subcollection
     const userDoc = await admin
       .firestore()
       .collection('users')
       .doc(receiverId)
+      .collection('private')
+      .doc('data')
       .get();
 
     if (!userDoc.exists) {
@@ -165,6 +183,8 @@ app.post('/sendNotification', async (req, res) => {
           .firestore()
           .collection('users')
           .doc(req.body.receiverId)
+          .collection('private')
+          .doc('data')
           .update({
             fcmToken: admin.firestore.FieldValue.delete(),
           });
@@ -194,10 +214,14 @@ app.post('/sendBroadcast', async (req, res) => {
       return res.status(400).json({ success: false, error: 'title and body missing' });
     }
 
-    // Fetch all users with tokens
-    const usersSnap = await admin.firestore().collection('users').get();
+    // Fetch all users with tokens from private subcollections
+    // (This requires a collectionGroup query or fetching all users then their private data)
+    // Since fetching all subcollections is heavy, we'll use a collectionGroup query.
+    // Note: this requires creating a single-field index for fcmToken in the Firebase Console if you query by it, 
+    // but just getting all from collection group 'private' is possible.
+    const privateDocsSnap = await admin.firestore().collectionGroup('private').get();
     const tokens = [];
-    usersSnap.forEach((doc) => {
+    privateDocsSnap.forEach((doc) => {
       const token = doc.data().fcmToken;
       if (token) tokens.push(token);
     });
