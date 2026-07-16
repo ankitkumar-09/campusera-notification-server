@@ -21,7 +21,7 @@ app.use((req, res, next) => {
 // ===============================
 // API Key Middleware
 // ===============================
-const API_KEY = process.env.API_KEY || 'default_secret_key'; // Replace in Render
+const API_KEY = process.env.API_KEY || 'Ankit#9921'; // Replace in Render
 
 app.use((req, res, next) => {
   if (req.url === '/') return next(); // allow health check
@@ -126,32 +126,23 @@ app.post('/sendNotification', async (req, res) => {
     }
 
     const isPost = type === 'new_post';
+    const isChat = type === 'chat';
 
     const message = {
       token,
 
-      notification: {
-        title: isPost ? `${senderName} posted` : senderName || 'New Message',
-        body: body || '',
-      },
-
       data: {
         type: type || 'chat',
-        senderId: senderId || '',
-        receiverId: receiverId || '',
-        senderName: senderName || '',
-        postId: postId || '',
+        senderId: String(senderId || ''),
+        receiverId: String(receiverId || ''),
+        senderName: String(senderName || ''),
+        postId: String(postId || ''),
+        body: String(body || ''),
+        title: String(senderName || 'New Message'),
       },
 
       android: {
         priority: 'high',
-        notification: {
-          channelId: 'campusera_channel',
-          sound: 'default',
-          priority: 'high',
-          visibility: 'public',
-          tag: senderId || 'default',
-        },
       },
 
       apns: {
@@ -162,6 +153,20 @@ app.post('/sendNotification', async (req, res) => {
         },
       },
     };
+
+    if (!isChat) {
+      message.notification = {
+        title: isPost ? `${senderName} posted` : senderName || 'New Message',
+        body: body || '',
+      };
+      message.android.notification = {
+        channelId: 'campusera_channel',
+        sound: 'default',
+        priority: 'high',
+        visibility: 'public',
+        tag: senderId || 'default',
+      };
+    }
 
     const response = await admin.messaging().send(message);
 
