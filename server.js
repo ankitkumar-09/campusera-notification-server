@@ -19,20 +19,38 @@ app.use((req, res, next) => {
 });
 
 // ===============================
-// API Key Middleware
+// Auth Middlewares
 // ===============================
-const API_KEY = process.env.API_KEY || 'Ankit#9921'; // Replace in Render
+const API_KEY = process.env.API_KEY || 'Ankit#9921';
 
-app.use((req, res, next) => {
-  if (req.url === '/') return next(); // allow health check
-
+// API Key auth — for server-to-server / admin routes (old endpoints)
+const requireApiKey = (req, res, next) => {
   const authHeader = req.headers.authorization;
   if (!authHeader || !authHeader.startsWith('Bearer ') || authHeader.split(' ')[1] !== API_KEY) {
-    console.log('❌ Unauthorized request');
+    console.log('❌ Unauthorized: Invalid API key');
     return res.status(401).json({ success: false, error: 'Unauthorized' });
   }
   next();
-});
+};
+
+// Firebase ID Token auth — for user-facing routes (new scalable endpoints)
+// Flutter sends: FirebaseAuth.instance.currentUser.getIdToken()
+// This guarantees the request comes from a real, logged-in app user.
+const requireFirebaseAuth = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Missing Firebase token' });
+  }
+  const idToken = authHeader.split(' ')[1];
+  try {
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    req.uid = decoded.uid; // attach verified UID to request
+    next();
+  } catch (err) {
+    console.log('❌ Invalid Firebase token:', err.message);
+    return res.status(401).json({ success: false, error: 'Invalid or expired Firebase token' });
+  }
+};
 
 // ===============================
 // Firebase Admin Setup
@@ -69,7 +87,7 @@ app.get('/', (req, res) => {
 // ===============================
 // Send Notification Route
 // ===============================
-app.post('/sendNotification', async (req, res) => {
+app.post('/sendNotification', requireApiKey, async (req, res) => {
   try {
     const {
       receiverId,
@@ -209,7 +227,7 @@ app.post('/sendNotification', async (req, res) => {
 // ===============================
 // Send Broadcast Route
 // ===============================
-app.post('/sendBroadcast', async (req, res) => {
+app.post('/sendBroadcast', requireApiKey, async (req, res) => {
   try {
     const { title, body, senderId, type } = req.body;
 
@@ -283,6 +301,143 @@ app.post('/sendBroadcast', async (req, res) => {
     return res.status(500).json({ success: false, error: error.message });
   }
 });
+
+// ===============================
+// SCALABLE: Feed Post Notification via FCM Topic
+// All users subscribe to 'all_feed_posts' topic on login.
+// This single call fans out to ALL subscribed devices instantly — no token loops.
+// ===============================
+app.post('/sendFeedPost', requireFirebaseAuth, async (req, res) => {
+  try {
+    const { senderName, postId, body } = req.body;
+    const senderId = req.uid; // 🔒 Always use verified Firebase UID — client cannot spoof this
+
+    console.log(`📨 Feed Post from verified user ${senderId}:`, { senderName, postId });
+
+    if (!senderName || !postId) {
+      return res.status(400).json({ success: false, error: 'senderName and postId are required' });
+    }
+
+    const message = {
+      topic: 'all_feed_posts',
+      notification: {
+        title: senderName,
+        body: body || `${senderName} shared a new post`,
+      },
+      data: {
+        type: 'new_post',
+        postId: String(postId),
+        senderId: String(senderId || ''),
+        senderName: String(senderName),
+        click_action: 'FLUTTER_NOTIFICATION_CLICK',
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'campusera_channel',
+          sound: 'default',
+          priority: 'high',
+          visibility: 'public',
+        },
+      },
+      apns: {
+        payload: { aps: { sound: 'default', badge: 1 } },
+      },
+    };
+
+    const response = await admin.messaging().send(message);
+    console.log('✅ Feed topic notification sent:', response);
+    return res.json({ success: true, response });
+
+  } catch (error) {
+    console.error('❌ Feed Notification Error:', error);
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ===============================
+// SCALABLE: Comment Notification (targeted — one token, one call)
+// No user loops. Fetches only the post author's token.
+// ===============================
+app.post('/sendCommentNotification', requireFirebaseAuth, async (req, res) => {
+  try {
+    const { postAuthorId, commenterName, postId, commentPreview } = req.body;
+    const commenterId = req.uid; // 🔒 Always use verified Firebase UID — client cannot spoof this
+
+    console.log(`📨 Comment Notification from verified user ${commenterId}:`, { postAuthorId, postId });
+
+    if (!postAuthorId || !commenterName || !postId) {
+      return res.status(400).json({ success: false, error: 'postAuthorId, commenterName, postId are required' });
+    }
+
+    // Don't notify if author comments on their own post (using verified UID)
+    if (commenterId === postAuthorId) {
+      return res.json({ success: true, skipped: true, reason: 'Self-comment' });
+    }
+
+    // Fetch only the post author's token (1 Firestore read)
+    const userDoc = await admin.firestore()
+      .collection('users').doc(postAuthorId)
+      .collection('private').doc('data')
+      .get();
+
+    if (!userDoc.exists || !userDoc.data()?.fcmToken) {
+      return res.json({ success: true, skipped: true, reason: 'No FCM token for author' });
+    }
+
+    const token = userDoc.data().fcmToken;
+    const bodyText = commentPreview
+      ? `${commenterName}: ${commentPreview}`
+      : `${commenterName} commented on your post`;
+
+    const message = {
+      token,
+      notification: { title: commenterName, body: bodyText },
+      data: {
+        type: 'new_comment',
+        postId: String(postId),
+        senderId: String(commenterId || ''),
+        senderName: String(commenterName),
+        click_action: 'FLUTTER_NOTIFICATION_CLICK',
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'campusera_channel',
+          sound: 'default',
+          priority: 'high',
+          tag: commenterId || 'comment',
+        },
+      },
+      apns: {
+        payload: { aps: { sound: 'default', badge: 1 } },
+      },
+    };
+
+    const response = await admin.messaging().send(message);
+    console.log('✅ Comment notification sent:', response);
+    return res.json({ success: true, response });
+
+  } catch (error) {
+    console.error('❌ Comment Notification Error:', error);
+
+    // Auto-cleanup stale token
+    if (error.code === 'messaging/registration-token-not-registered') {
+      try {
+        await admin.firestore()
+          .collection('users').doc(req.body.postAuthorId)
+          .collection('private').doc('data')
+          .update({ fcmToken: admin.firestore.FieldValue.delete() });
+        console.log('🗑️ Stale token deleted for:', req.body.postAuthorId);
+      } catch (cleanupError) {
+        console.log('⚠️ Cleanup error:', cleanupError);
+      }
+    }
+
+    return res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 
 // ===============================
 // Global Error Handlers
