@@ -84,6 +84,12 @@ app.get('/', (req, res) => {
   });
 });
 
+// Lightweight warmup endpoint — Flutter calls this on app launch so the
+// server is hot before the first real notification request arrives.
+app.get('/ping', (req, res) => {
+  res.status(200).json({ ok: true, uptime: process.uptime() });
+});
+
 // ===============================
 // Send Notification Route
 // ===============================
@@ -531,4 +537,35 @@ const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
   console.log(`🚀 Notification server running on port ${PORT}`);
+
+  // ─────────────────────────────────────────────────────────────────
+  // KEEPALIVE SELF-PING — Prevents Render free-tier sleep
+  //
+  // Render free-tier spins the server DOWN after 15 minutes of no
+  // inbound traffic. Cold-boot takes ~50s. Flutter's HTTP timeout is
+  // 70s which MIGHT cover it, but the first notification after a long
+  // idle period is still at risk.
+  //
+  // Fix: ping ourselves every 14 minutes. As long as the server is
+  // running, this keeps it "warm" so the next real request lands
+  // instantly instead of waiting for a cold boot.
+  // ─────────────────────────────────────────────────────────────────
+  const RENDER_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+
+  setInterval(async () => {
+    try {
+      const https = require('https');
+      const http  = require('http');
+      const url   = new URL(RENDER_URL);
+      const lib   = url.protocol === 'https:' ? https : http;
+
+      lib.get(RENDER_URL, (res) => {
+        console.log(`🏓 Self-ping OK — status ${res.statusCode} (server is warm)`);
+      }).on('error', (err) => {
+        console.warn('⚠️ Self-ping failed:', err.message);
+      });
+    } catch (e) {
+      console.warn('⚠️ Self-ping error:', e.message);
+    }
+  }, 14 * 60 * 1000); // every 14 minutes
 });
