@@ -31,19 +31,60 @@ const API_KEY = process.env.API_KEY || 'Ankit#9921';
 const PRESENCE_FRESHNESS_MS =
   parseInt(process.env.PRESENCE_FRESHNESS_MS, 10) || 60 * 1000;
 
-// API Key auth — for server-to-server / admin routes (old endpoints)
-const requireApiKey = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  // Fallback for older APK builds that were compiled without --dart-define
-  // They send either no header, or 'Bearer ' (empty string).
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.split(' ')[1];
-    if (token && token !== '' && token !== API_KEY) {
-      console.log('❌ Unauthorized: Invalid API key', token);
-      return res.status(401).json({ success: false, error: 'Unauthorized' });
-    }
+// ── Lightweight in-memory rate limiter ────────────────────────────────────
+// Render free tier runs a single instance, so an in-memory bucket is enough to
+// blunt spam/abuse. Buckets reset on their window (and on restart — acceptable).
+const _rateBuckets = new Map();
+function rateLimit(key, max, windowMs) {
+  const now = Date.now();
+  const b = _rateBuckets.get(key);
+  if (!b || now > b.reset) {
+    _rateBuckets.set(key, { count: 1, reset: now + windowMs });
+    return true;
   }
-  next();
+  if (b.count >= max) return false;
+  b.count += 1;
+  return true;
+}
+// Occasionally clear expired buckets so the map doesn't grow unbounded.
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _rateBuckets) if (now > v.reset) _rateBuckets.delete(k);
+}, 10 * 60 * 1000);
+
+// Auth for the notification routes.
+//
+// SECURITY: the previous version "failed open" — a request with no Authorization
+// header was allowed through, so anyone could send/spoof pushes. This now
+// REQUIRES a credential:
+//   1. A verified Firebase ID token (preferred — used by current app builds).
+//      When present, req.uid is the real, verified sender (can't be spoofed).
+//   2. The shared API key (legacy fallback for older installed builds).
+// Anything else (missing/empty/invalid) is rejected.
+const requireAuth = async (req, res, next) => {
+  const authHeader = req.headers.authorization || '';
+  if (!authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, error: 'Missing credentials' });
+  }
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ success: false, error: 'Missing credentials' });
+  }
+  // Prefer a verified Firebase ID token.
+  try {
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.uid = decoded.uid;
+    req.email = (decoded.email || '').toLowerCase();
+    req.authMethod = 'idtoken';
+    return next();
+  } catch (_) {
+    // Not an ID token — accept the legacy API key (old builds only).
+    if (token === API_KEY) {
+      req.authMethod = 'apikey';
+      return next();
+    }
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
 };
 
 // Firebase ID Token auth — for user-facing routes (new scalable endpoints)
@@ -106,18 +147,28 @@ app.get('/ping', (req, res) => {
 // ===============================
 // Send Notification Route
 // ===============================
-app.post('/sendNotification', requireApiKey, async (req, res) => {
+app.post('/sendNotification', requireAuth, async (req, res) => {
   try {
     const {
       receiverId,
       senderName,
       body,
-      senderId,
       type,
       postId,
     } = req.body;
 
-    console.log('📨 Notification Request:', req.body);
+    // Anti-spoof: when the caller is a verified app user, the sender is THEIR
+    // uid — never trust a client-supplied senderId. Legacy (API-key) callers
+    // fall back to the body value.
+    const senderId = req.authMethod === 'idtoken' ? req.uid : req.body.senderId;
+
+    // Rate limit per authenticated sender (or IP for legacy) to blunt spam.
+    const rlKey = 'notif:' + (req.uid || req.ip || 'anon');
+    if (!rateLimit(rlKey, 30, 60 * 1000)) {
+      return res.status(429).json({ success: false, error: 'Too many requests' });
+    }
+
+    console.log('📨 Notification Request:', { receiverId, type, senderId });
 
     if (!receiverId) {
       return res.status(400).json({
@@ -329,11 +380,26 @@ app.post('/sendNotification', requireApiKey, async (req, res) => {
 // ===============================
 // Send Broadcast Route
 // ===============================
-app.post('/sendBroadcast', requireApiKey, async (req, res) => {
+app.post('/sendBroadcast', requireAuth, async (req, res) => {
   try {
     const { title, body, senderId, type } = req.body;
 
-    console.log('📨 Broadcast Request:', req.body);
+    console.log('📨 Broadcast Request:', { title, type });
+
+    // Broadcast blasts EVERY user — admins only. A verified ID token whose
+    // email is in the `admins` collection is required (the legacy API key,
+    // which ships in the APK, is NOT sufficient here).
+    if (req.authMethod !== 'idtoken' || !req.email) {
+      return res.status(403).json({ success: false, error: 'Admin login required' });
+    }
+    try {
+      const adminDoc = await admin.firestore().collection('admins').doc(req.email).get();
+      if (!adminDoc.exists) {
+        return res.status(403).json({ success: false, error: 'Admins only' });
+      }
+    } catch (e) {
+      return res.status(403).json({ success: false, error: 'Admin check failed' });
+    }
 
     if (!title || !body) {
       return res.status(400).json({ success: false, error: 'title and body missing' });
@@ -413,6 +479,13 @@ app.post('/sendFeedPost', requireFirebaseAuth, async (req, res) => {
   try {
     const { senderName, postId, body } = req.body;
     const senderId = req.uid; // 🔒 Always use verified Firebase UID — client cannot spoof this
+
+    // Anti-spam: this fans out to EVERY user, so cap how often one account can
+    // trigger it. Blocks the "post in a loop → notification-bomb everyone"
+    // abuse. ~1 broadcast per 30s per user.
+    if (!rateLimit('feed:' + senderId, 1, 30 * 1000)) {
+      return res.status(429).json({ success: false, error: 'You are posting too fast. Please wait a moment.' });
+    }
 
     console.log(`📨 Feed Post from verified user ${senderId}:`, { senderName, postId });
 
