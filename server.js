@@ -23,6 +23,14 @@ app.use((req, res, next) => {
 // ===============================
 const API_KEY = process.env.API_KEY || 'Ankit#9921';
 
+// How recent the receiver's "actively viewing this chat" presence must be for
+// us to suppress a push. A client heartbeat refreshes it every ~25s, so 60s
+// gives comfortable slack. If the app is force-killed while a chat is open,
+// the presence goes stale within this window and notifications resume — no
+// more permanent silencing of a partner.
+const PRESENCE_FRESHNESS_MS =
+  parseInt(process.env.PRESENCE_FRESHNESS_MS, 10) || 60 * 1000;
+
 // API Key auth — for server-to-server / admin routes (old endpoints)
 const requireApiKey = (req, res, next) => {
   const authHeader = req.headers.authorization;
@@ -119,42 +127,15 @@ app.post('/sendNotification', requireApiKey, async (req, res) => {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    // SUPPRESSION CHECK — Scalable & tamper-proof.
-    // We fetch the receiver's activeChatUserId directly from Firestore so we
-    // never rely on a client-supplied value. This is the only source of truth.
+    // SINGLE READ — presence + token.
+    // The receiver's private/data doc holds BOTH the FCM token AND the chat
+    // presence (activeChatUserId + activeChatUpdatedAt). Reading it once covers
+    // suppression and delivery, halving Firestore reads per message.
     //
-    // Scenario: User B (receiver) is currently inside the chat with User A
-    // (sender). Their activeChatUserId in Firestore is set to User A's ID.
-    // In this case, we must NOT deliver a push notification — Flutter's
-    // foreground message handler will update the UI directly.
+    // Presence lives in the OWNER-ONLY private subcollection (not the public
+    // user doc), so a user's "who am I chatting with right now" never leaks to
+    // other users. The Admin SDK bypasses security rules, so we can still read it.
     // ─────────────────────────────────────────────────────────────────────────
-    if (type === 'chat' && senderId) {
-      try {
-        const receiverDoc = await admin
-          .firestore()
-          .collection('users')
-          .doc(receiverId)
-          .get();
-
-        if (receiverDoc.exists) {
-          const receiverActiveChatUserId = receiverDoc.data()?.activeChatUserId;
-          if (receiverActiveChatUserId === senderId) {
-            console.log(`🔕 Suppressed: Receiver ${receiverId} is already inside chat with sender ${senderId}`);
-            return res.json({
-              success: true,
-              skipped: true,
-              reason: 'Receiver already in chat with sender',
-            });
-          }
-        }
-      } catch (suppressionErr) {
-        // Non-fatal: if Firestore read fails, we proceed to send the notification
-        // rather than silently dropping it. Fail open for reliability.
-        console.warn('⚠️ Suppression check failed — proceeding to send:', suppressionErr.message);
-      }
-    }
-
-    // ✅ Always fetch fresh token from Firestore private subcollection
     const userDoc = await admin
       .firestore()
       .collection('users')
@@ -170,7 +151,42 @@ app.post('/sendNotification', requireApiKey, async (req, res) => {
       });
     }
 
-    const token = userDoc.data()?.fcmToken;
+    const userData = userDoc.data() || {};
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // SUPPRESSION CHECK — tamper-proof & self-healing (TTL).
+    //
+    // Suppress only when the receiver is CURRENTLY (freshly) viewing the chat
+    // with this sender. The activeChatUpdatedAt timestamp is refreshed by a
+    // client heartbeat while the chat is foregrounded; if the app is killed or
+    // backgrounded, it goes stale within PRESENCE_FRESHNESS_MS and we deliver
+    // the notification normally. This removes the old "stuck flag → messages
+    // silenced forever" failure mode.
+    // ─────────────────────────────────────────────────────────────────────────
+    if (type === 'chat' && senderId && userData.activeChatUserId === senderId) {
+      const updatedAt = userData.activeChatUpdatedAt;
+      const updatedMs =
+        updatedAt && typeof updatedAt.toMillis === 'function'
+          ? updatedAt.toMillis()
+          : 0;
+      const ageMs = Date.now() - updatedMs;
+
+      if (updatedMs > 0 && ageMs <= PRESENCE_FRESHNESS_MS) {
+        console.log(
+          `🔕 Suppressed: ${receiverId} is actively viewing chat with ${senderId} (presence ${ageMs}ms old)`
+        );
+        return res.json({
+          success: true,
+          skipped: true,
+          reason: 'Receiver actively viewing chat with sender',
+        });
+      }
+      console.log(
+        `🔔 Presence stale (${ageMs}ms > ${PRESENCE_FRESHNESS_MS}ms) — delivering notification to ${receiverId}`
+      );
+    }
+
+    const token = userData.fcmToken;
 
     if (!token) {
       return res.json({
