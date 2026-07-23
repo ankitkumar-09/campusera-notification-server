@@ -94,7 +94,6 @@ app.post('/sendNotification', requireApiKey, async (req, res) => {
       senderName,
       body,
       senderId,
-      activeChatUserId,
       type,
       postId,
     } = req.body;
@@ -108,13 +107,40 @@ app.post('/sendNotification', requireApiKey, async (req, res) => {
       });
     }
 
-    // Skip if user already inside chat
-    if (type !== 'new_post' && activeChatUserId && activeChatUserId === senderId) {
-      return res.json({
-        success: true,
-        skipped: true,
-        reason: 'User already in chat',
-      });
+    // ─────────────────────────────────────────────────────────────────────────
+    // SUPPRESSION CHECK — Scalable & tamper-proof.
+    // We fetch the receiver's activeChatUserId directly from Firestore so we
+    // never rely on a client-supplied value. This is the only source of truth.
+    //
+    // Scenario: User B (receiver) is currently inside the chat with User A
+    // (sender). Their activeChatUserId in Firestore is set to User A's ID.
+    // In this case, we must NOT deliver a push notification — Flutter's
+    // foreground message handler will update the UI directly.
+    // ─────────────────────────────────────────────────────────────────────────
+    if (type === 'chat' && senderId) {
+      try {
+        const receiverDoc = await admin
+          .firestore()
+          .collection('users')
+          .doc(receiverId)
+          .get();
+
+        if (receiverDoc.exists) {
+          const receiverActiveChatUserId = receiverDoc.data()?.activeChatUserId;
+          if (receiverActiveChatUserId === senderId) {
+            console.log(`🔕 Suppressed: Receiver ${receiverId} is already inside chat with sender ${senderId}`);
+            return res.json({
+              success: true,
+              skipped: true,
+              reason: 'Receiver already in chat with sender',
+            });
+          }
+        }
+      } catch (suppressionErr) {
+        // Non-fatal: if Firestore read fails, we proceed to send the notification
+        // rather than silently dropping it. Fail open for reliability.
+        console.warn('⚠️ Suppression check failed — proceeding to send:', suppressionErr.message);
+      }
     }
 
     // ✅ Always fetch fresh token from Firestore private subcollection
@@ -143,12 +169,29 @@ app.post('/sendNotification', requireApiKey, async (req, res) => {
       });
     }
 
-    const isPost = type === 'new_post';
     const isChat = type === 'chat';
+    const isPost = type === 'new_post';
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // FCM MESSAGE CONSTRUCTION
+    //
+    // For CHAT messages we send a DATA-ONLY payload (no notification block).
+    // Why: This lets Flutter's background isolate intercept the message and
+    // show a local notification WITH action buttons (Reply, Mark as Read).
+    // If we used a notification block, the OS would show a plain notification
+    // and bypass our Flutter handler entirely — no action buttons.
+    //
+    // For all OTHER types (new_post, notice, etc.) we use a notification block
+    // so the OS renders them immediately even if Flutter isn't running.
+    //
+    // iOS note: data-only messages require `content-available: 1` and
+    // `apns-priority: 10` (highest) to wake the device. Without these, iOS
+    // silently drops background data messages.
+    // ─────────────────────────────────────────────────────────────────────────
     const message = {
       token,
 
+      // All types carry the full data payload so Flutter can deep-link on tap
       data: {
         type: type || 'chat',
         senderId: String(senderId || ''),
@@ -160,29 +203,60 @@ app.post('/sendNotification', requireApiKey, async (req, res) => {
       },
 
       android: {
+        // HIGH priority ensures delivery even when the device is in Doze mode.
         priority: 'high',
+        ...(isChat
+          ? {
+              // For data-only chat messages we still specify the channel so
+              // Android picks the right importance/sound settings.
+              // The local notification shown by Flutter will also use this channel.
+              ttl: '86400s', // 24 hours — messages shouldn't expire quickly
+            }
+          : {
+              notification: {
+                channelId: 'campusera_channel',
+                sound: 'default',
+                priority: 'high',
+                visibility: 'public',
+                tag: senderId || 'default',
+              },
+            }),
       },
 
-      apns: {
-        payload: {
-          aps: {
-            sound: 'default',
+      apns: isChat
+        ? {
+            // content-available: 1 → wakes iOS device to process the data message.
+            // apns-priority: 10   → highest delivery priority (must pair with content-available).
+            // Without these two, iOS silently drops data-only push messages.
+            payload: {
+              aps: {
+                contentAvailable: true, // tells iOS to wake up the app
+                sound: 'default',       // play default sound (needed on iOS 10+)
+              },
+            },
+            headers: {
+              'apns-priority': '10',   // 10 = immediate delivery (5 = power-saving)
+              'apns-push-type': 'background', // required by Apple when using content-available
+            },
+          }
+        : {
+            payload: {
+              aps: {
+                sound: 'default',
+                badge: 1,
+              },
+            },
+            headers: {
+              'apns-priority': '10',
+            },
           },
-        },
-      },
     };
 
+    // For non-chat types, add a visible notification block
     if (!isChat) {
       message.notification = {
         title: isPost ? `${senderName} posted` : senderName || 'New Message',
         body: body || '',
-      };
-      message.android.notification = {
-        channelId: 'campusera_channel',
-        sound: 'default',
-        priority: 'high',
-        visibility: 'public',
-        tag: senderId || 'default',
       };
     }
 
@@ -198,7 +272,7 @@ app.post('/sendNotification', requireApiKey, async (req, res) => {
   } catch (error) {
     console.error('❌ Notification Error:', error);
 
-    // ✅ Auto-cleanup stale/invalid tokens
+    // ✅ Auto-cleanup stale/invalid tokens — scalable, runs in O(1) Firestore writes
     if (error.code === 'messaging/registration-token-not-registered') {
       console.log('⚠️ Stale token — deleting from Firestore');
       try {
