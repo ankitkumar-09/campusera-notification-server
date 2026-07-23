@@ -26,9 +26,14 @@ const API_KEY = process.env.API_KEY || 'Ankit#9921';
 // API Key auth — for server-to-server / admin routes (old endpoints)
 const requireApiKey = (req, res, next) => {
   const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ') || authHeader.split(' ')[1] !== API_KEY) {
-    console.log('❌ Unauthorized: Invalid API key');
-    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  // Fallback for older APK builds that were compiled without --dart-define
+  // They send either no header, or 'Bearer ' (empty string).
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.split(' ')[1];
+    if (token && token !== '' && token !== API_KEY) {
+      console.log('❌ Unauthorized: Invalid API key', token);
+      return res.status(401).json({ success: false, error: 'Unauthorized' });
+    }
   }
   next();
 };
