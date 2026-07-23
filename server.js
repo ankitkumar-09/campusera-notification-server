@@ -234,10 +234,11 @@ app.post('/sendNotification', requireApiKey, async (req, res) => {
         priority: 'high',
         ...(isChat
           ? {
-              // For data-only chat messages we still specify the channel so
-              // Android picks the right importance/sound settings.
-              // The local notification shown by Flutter will also use this channel.
-              ttl: '86400s', // 24 hours — messages shouldn't expire quickly
+              // Firebase Admin (Node) expects ttl as a NUMBER of milliseconds.
+              // The '86400s' string form is only valid in the FCM REST API and
+              // was making every chat push fail validation ("TTL must be a
+              // non-negative duration in milliseconds").
+              ttl: 86400000, // 24h in ms — messages shouldn't expire quickly
             }
           : {
               notification: {
