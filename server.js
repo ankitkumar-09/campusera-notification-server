@@ -382,9 +382,9 @@ app.post('/sendNotification', requireAuth, async (req, res) => {
 // ===============================
 app.post('/sendBroadcast', requireAuth, async (req, res) => {
   try {
-    const { title, body, senderId, type } = req.body;
+    const { title, body, senderId, type, imageUrl } = req.body;
 
-    console.log('📨 Broadcast Request:', { title, type });
+    console.log('📨 Broadcast Request:', { title, type, hasImage: !!imageUrl });
 
     // Broadcast blasts EVERY user — admins only. A verified ID token whose
     // email is in the `admins` collection is required (the legacy API key,
@@ -421,21 +421,47 @@ app.post('/sendBroadcast', requireAuth, async (req, res) => {
       return res.json({ success: true, skipped: true, reason: 'No tokens found' });
     }
 
+    const hasImage = typeof imageUrl === 'string' && imageUrl.trim().length > 0;
+
+    // Which admin sound did the portal pick? 'default' (or empty) = normal
+    // channel/sound; otherwise route to the matching custom-sound channel that
+    // the app created (campusera_admin_<key> / raw resource admin_<key>).
+    const soundKey =
+      typeof req.body.sound === 'string' && req.body.sound.trim()
+        ? req.body.sound.trim().toLowerCase()
+        : 'default';
+    const isCustomSound = soundKey !== 'default';
+    const androidChannelId = isCustomSound ? `campusera_admin_${soundKey}` : 'campusera_channel';
+    const androidSound = isCustomSound ? soundKey : 'default';
+    const iosSound = isCustomSound ? `${soundKey}.caf` : 'default';
+
     const message = {
-      notification: { title, body },
+      notification: {
+        title,
+        body,
+        // Top-level image → shown as a big picture by the OS on Android.
+        ...(hasImage ? { imageUrl: imageUrl.trim() } : {}),
+      },
       data: {
         type: type || 'notice',
         senderId: senderId || 'admin',
+        // Passed through so the Flutter foreground handler can render the image
+        // and pick the correct custom-sound channel.
+        imageUrl: hasImage ? imageUrl.trim() : '',
+        sound: soundKey,
       },
       android: {
         priority: 'high',
         notification: {
-          channelId: 'campusera_channel',
-          sound: 'default',
+          channelId: androidChannelId,
+          sound: androidSound,
+          visibility: 'public',
+          ...(hasImage ? { imageUrl: imageUrl.trim() } : {}),
         },
       },
       apns: {
-        payload: { aps: { sound: 'default' } },
+        payload: { aps: { sound: iosSound, 'mutable-content': 1 } },
+        ...(hasImage ? { fcmOptions: { imageUrl: imageUrl.trim() } } : {}),
       },
     };
 
