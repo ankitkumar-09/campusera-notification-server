@@ -431,7 +431,9 @@ app.post('/sendBroadcast', requireAuth, async (req, res) => {
         ? req.body.sound.trim().toLowerCase()
         : 'default';
     const isCustomSound = soundKey !== 'default';
-    const androidChannelId = isCustomSound ? `campusera_admin_${soundKey}` : 'campusera_channel';
+    // Must match the app's versioned admin channel id (_adminChannelIdFor).
+    // Bump this suffix in lockstep with the app whenever sounds change.
+    const androidChannelId = isCustomSound ? `campusera_admin_${soundKey}_v2` : 'campusera_channel';
     const androidSound = isCustomSound ? soundKey : 'default';
     const iosSound = isCustomSound ? `${soundKey}.caf` : 'default';
 
