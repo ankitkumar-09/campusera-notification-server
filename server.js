@@ -411,11 +411,15 @@ app.post('/sendBroadcast', requireAuth, async (req, res) => {
     // Note: this requires creating a single-field index for fcmToken in the Firebase Console if you query by it, 
     // but just getting all from collection group 'private' is possible.
     const privateDocsSnap = await admin.firestore().collectionGroup('private').get();
-    const tokens = [];
+    const tokenSet = new Set();
     privateDocsSnap.forEach((doc) => {
       const token = doc.data().fcmToken;
-      if (token) tokens.push(token);
+      if (token) tokenSet.add(token);
     });
+    // Dedupe: the SAME device token can be saved under multiple accounts (after
+    // logout/login or account switching on one phone). Without this, that device
+    // receives the notice twice. A Set guarantees one push per unique device.
+    const tokens = [...tokenSet];
 
     if (tokens.length === 0) {
       return res.json({ success: true, skipped: true, reason: 'No tokens found' });
