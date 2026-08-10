@@ -298,6 +298,7 @@ app.post('/sendNotification', requireAuth, async (req, res) => {
                 priority: 'high',
                 visibility: 'public',
                 tag: senderId || 'default',
+                color: '#FF6B35', // brand accent tints the small status-bar icon
               },
             }),
       },
@@ -462,6 +463,7 @@ app.post('/sendBroadcast', requireAuth, async (req, res) => {
           channelId: androidChannelId,
           sound: androidSound,
           visibility: 'public',
+          color: '#FF6B35', // brand accent tints the small status-bar icon
           ...(hasImage ? { imageUrl: imageUrl.trim() } : {}),
         },
       },
@@ -545,6 +547,7 @@ app.post('/sendFeedPost', requireFirebaseAuth, async (req, res) => {
           sound: 'default',
           priority: 'high',
           visibility: 'public',
+          color: '#FF6B35', // brand accent tints the small status-bar icon
         },
       },
       apns: {
@@ -614,6 +617,7 @@ app.post('/sendCommentNotification', requireFirebaseAuth, async (req, res) => {
           sound: 'default',
           priority: 'high',
           tag: commenterId || 'comment',
+          color: '#FF6B35', // brand accent tints the small status-bar icon
         },
       },
       apns: {
